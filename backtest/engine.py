@@ -2,13 +2,30 @@
 
 Fill model (documented assumptions):
     * The strategy sees bars up to and including bar i, and its signal
-      executes at bar i+1's OPEN — never at prices the strategy already saw.
+      executes during bar i+1 — never at prices the strategy already saw.
       This prevents look-ahead bias.
-    * All orders are market orders, so the TAKER fee applies to every fill
-      (a scalper crossing the spread is a taker). Fees are configured in
-      config.settings.FeeConfig; the Binance VIP 0 default is 0.10%.
-    * Slippage is a fixed bps penalty against the trader: buys fill at
-      open * (1 + slip), sells at open * (1 - slip).
+    * In TAKER mode (the default, config.settings.FillMode): all orders are
+      market orders filled at bar i+1's OPEN, so the TAKER fee applies to
+      every fill (a scalper crossing the spread is a taker). Fees are
+      configured in config.settings.FeeConfig; the Binance VIP 0 default is
+      0.10%. Slippage is a fixed bps penalty against the trader: buys fill
+      at open * (1 + slip), sells at open * (1 - slip).
+    * In MAKER_OPTIMISTIC mode: each signal is a LIMIT order at the signal
+      bar's CLOSE (L). A pending BUY fills during bar i+1 iff that bar's
+      low <= L; a pending SELL fills iff the bar's high >= L. Fills happen
+      at exactly L, pay the MAKER fee, and take no slippage.
+      WARNING — optimistic by construction: this model has NO queue-position
+      awareness. It assumes any price touch fills immediately, which real
+      limit orders often don't (you rest behind other orders at that price),
+      and touch-fills are adversely selected. Maker-mode results are a lower
+      bound on cost / an upper bound on performance, not a proven achievable
+      cost.
+    * Deliberate maker-mode simplifications: order lifetime is one bar
+      (cancel-and-replace, as the strategy re-emits its signal each bar),
+      there are no partial fills, and fills happen at exactly the limit
+      price even when the bar gaps through it. A stricter trade-through rule
+      (low < L instead of <=) is a possible future refinement, not
+      implemented.
     * Positions are long/flat only in Stage 1. BUY opens a fixed
       quote-value position when flat; SELL closes the whole position.
     * Every order is reviewed by the RiskManager before it can fill —
@@ -20,7 +37,7 @@ from dataclasses import dataclass, field
 
 import pandas as pd
 
-from config.settings import BacktestConfig, FeeConfig
+from config.settings import BacktestConfig, FeeConfig, FillMode
 from core.models import AccountState, Fill, OrderRequest, Side, Signal, Trade
 from backtest.metrics import compute_metrics
 from risk.risk_manager import RiskManager
@@ -102,57 +119,77 @@ class BacktestEngine:
         trades: list[Trade] = []
         fills: list[Fill] = []
         pending = Signal.HOLD
+        pending_price: float | None = None
+        maker = self._config.fill_mode is FillMode.MAKER_OPTIMISTIC
 
         for i in range(len(bars)):
             bar = bars.iloc[i]
             open_price = float(bar["open"])
             timestamp = int(bar["open_time"])
 
-            # 1. Execute last bar's signal at this bar's open.
+            # 1. Execute last bar's signal: at this bar's open (taker mode),
+            #    or as a limit at the signal bar's close if this bar touches
+            #    it (maker_optimistic mode).
             if pending is Signal.BUY and qty == 0.0:
-                exec_price = open_price * (1 + slip)
-                order_qty = self._config.position_size_quote / exec_price
-                order = OrderRequest(self._symbol, Side.BUY, order_qty, exec_price, timestamp)
-                account = AccountState(cash, qty, cash + qty * open_price)
-                if self._risk.review_order(order, account).approved:
-                    fee = order_qty * exec_price * self._fees.taker_fee
-                    cost = order_qty * exec_price + fee
-                    if cost <= cash:
-                        cash -= cost
-                        qty = order_qty
-                        fees_total += fee
-                        entry_fill = Fill(
-                            self._symbol, Side.BUY, order_qty, exec_price, fee, timestamp
-                        )
-                        fills.append(entry_fill)
-                    else:
-                        logger.warning(
-                            "Skipped BUY at %d: cost %.2f > cash %.2f", timestamp, cost, cash
-                        )
+                if maker:
+                    touched = pending_price is not None and float(bar["low"]) <= pending_price
+                    exec_price = pending_price if touched else None
+                    fee_rate = self._fees.maker_fee
+                else:
+                    exec_price = open_price * (1 + slip)
+                    fee_rate = self._fees.taker_fee
+                if exec_price is not None:
+                    order_qty = self._config.position_size_quote / exec_price
+                    order = OrderRequest(self._symbol, Side.BUY, order_qty, exec_price, timestamp)
+                    account = AccountState(cash, qty, cash + qty * open_price)
+                    if self._risk.review_order(order, account).approved:
+                        fee = order_qty * exec_price * fee_rate
+                        cost = order_qty * exec_price + fee
+                        if cost <= cash:
+                            cash -= cost
+                            qty = order_qty
+                            fees_total += fee
+                            entry_fill = Fill(
+                                self._symbol, Side.BUY, order_qty, exec_price, fee, timestamp
+                            )
+                            fills.append(entry_fill)
+                        else:
+                            logger.warning(
+                                "Skipped BUY at %d: cost %.2f > cash %.2f", timestamp, cost, cash
+                            )
             elif pending is Signal.SELL and qty > 0.0 and entry_fill is not None:
-                exec_price = open_price * (1 - slip)
-                order = OrderRequest(self._symbol, Side.SELL, qty, exec_price, timestamp)
-                account = AccountState(cash, qty, cash + qty * open_price)
-                if self._risk.review_order(order, account).approved:
-                    proceeds = qty * exec_price
-                    fee = proceeds * self._fees.taker_fee
-                    cash += proceeds - fee
-                    fees_total += fee
-                    exit_fill = Fill(self._symbol, Side.SELL, qty, exec_price, fee, timestamp)
-                    fills.append(exit_fill)
-                    pnl = (proceeds - fee) - (
-                        entry_fill.quantity * entry_fill.price + entry_fill.fee
-                    )
-                    trades.append(Trade(entry_fill, exit_fill, pnl))
-                    qty = 0.0
-                    entry_fill = None
+                if maker:
+                    touched = pending_price is not None and float(bar["high"]) >= pending_price
+                    exec_price = pending_price if touched else None
+                    fee_rate = self._fees.maker_fee
+                else:
+                    exec_price = open_price * (1 - slip)
+                    fee_rate = self._fees.taker_fee
+                if exec_price is not None:
+                    order = OrderRequest(self._symbol, Side.SELL, qty, exec_price, timestamp)
+                    account = AccountState(cash, qty, cash + qty * open_price)
+                    if self._risk.review_order(order, account).approved:
+                        proceeds = qty * exec_price
+                        fee = proceeds * fee_rate
+                        cash += proceeds - fee
+                        fees_total += fee
+                        exit_fill = Fill(self._symbol, Side.SELL, qty, exec_price, fee, timestamp)
+                        fills.append(exit_fill)
+                        pnl = (proceeds - fee) - (
+                            entry_fill.quantity * entry_fill.price + entry_fill.fee
+                        )
+                        trades.append(Trade(entry_fill, exit_fill, pnl))
+                        qty = 0.0
+                        entry_fill = None
 
             # 2. Mark equity to market at this bar's close.
             equity_points.append(cash + qty * float(bar["close"]))
 
-            # 3. Ask the strategy for the signal to act on next bar.
+            # 3. Ask the strategy for the signal to act on next bar. The
+            #    signal bar's close is the limit price in maker mode.
             window_start = max(0, i - self._config.lookback_bars + 1)
             pending = self._strategy.on_bar(bars.iloc[window_start : i + 1])
+            pending_price = float(bar["close"])
 
         equity_curve = pd.Series(equity_points, index=bars["open_time"].to_numpy())
         metrics = compute_metrics(equity_curve, trades, fees_total, self._config.initial_cash)

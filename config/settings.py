@@ -23,8 +23,31 @@ permission.
 
 import os
 from dataclasses import dataclass, field
+from enum import Enum
 
 from dotenv import load_dotenv
+
+
+class FillMode(Enum):
+    """How the backtest engine simulates order fills.
+
+    Members:
+        TAKER: Market orders at the next bar's open, with slippage applied
+            against the trader and the taker fee charged. The conservative
+            default.
+        MAKER_OPTIMISTIC: Limit orders at the signal bar's close, filled when
+            price touches the limit, charged the maker fee, with no slippage.
+
+            WARNING — optimistic by construction: this model has NO
+            queue-position awareness. It assumes any price touch fills
+            immediately, which real limit orders often don't (you rest behind
+            other orders at that price), and touch-fills are adversely
+            selected. Maker-mode results are therefore a LOWER BOUND on cost
+            / an UPPER BOUND on performance, not a proven achievable cost.
+    """
+
+    TAKER = "taker"
+    MAKER_OPTIMISTIC = "maker_optimistic"
 
 
 @dataclass(frozen=True)
@@ -44,12 +67,15 @@ class BacktestConfig:
         initial_cash: Starting quote-currency (USDT) balance.
         position_size_quote: Quote value of each position the bot opens.
         lookback_bars: Number of recent bars handed to the strategy each step.
+        fill_mode: Fill simulation model; see FillMode (and its optimism
+            caveat for MAKER_OPTIMISTIC).
     """
 
     slippage_bps: float = 1.0
     initial_cash: float = 10_000.0
     position_size_quote: float = 1_000.0
     lookback_bars: int = 100
+    fill_mode: FillMode = FillMode.TAKER
 
 
 @dataclass(frozen=True)
@@ -79,6 +105,7 @@ def load_config() -> AppConfig:
     )
     backtest = BacktestConfig(
         slippage_bps=float(os.getenv("SLIPPAGE_BPS", "1.0")),
+        fill_mode=FillMode(os.getenv("FILL_MODE", "taker").strip().lower()),
     )
     return AppConfig(
         fees=fees,

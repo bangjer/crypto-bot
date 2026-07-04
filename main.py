@@ -6,12 +6,13 @@ additionally guarded by the LIVE_TRADING_ENABLED config flag.
 """
 
 import argparse
+import dataclasses
 import logging
 import sys
 from datetime import datetime, timedelta, timezone
 
 from backtest.engine import BacktestEngine, BacktestResult
-from config.settings import AppConfig, load_config
+from config.settings import AppConfig, FillMode, load_config
 from datafeed.service import get_klines
 from execution.live import LiveExecutor
 from execution.paper import PaperExecutor
@@ -59,6 +60,13 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.0,
         help="mean_reversion only: exit deviation above the SMA in basis points",
+    )
+    parser.add_argument(
+        "--fill-mode",
+        choices=["taker", "maker_optimistic"],
+        default=None,
+        help="Override FILL_MODE: taker (market orders at open, slippage + taker fee) or "
+        "maker_optimistic (limit at signal close, maker fee — optimistic touch-fill model)",
     )
     parser.add_argument("--start", help="Backtest start date, YYYY-MM-DD (UTC)")
     parser.add_argument("--end", help="Backtest end date, YYYY-MM-DD (UTC, exclusive)")
@@ -115,16 +123,20 @@ def strategy_kwargs(args: argparse.Namespace) -> dict[str, int | float]:
     return {}
 
 
-def print_report(result: BacktestResult, symbol: str, strategy_name: str) -> None:
+def print_report(
+    result: BacktestResult, symbol: str, strategy_name: str, fill_mode: FillMode
+) -> None:
     """Print a human-readable backtest report.
 
     Args:
         result: The finished backtest.
         symbol: Trading pair that was tested.
         strategy_name: Registry name of the strategy.
+        fill_mode: Fill model the backtest ran with.
     """
     metrics = result.metrics
     print(f"\n=== Backtest report: {strategy_name} on {symbol} ===")
+    print(f"Fill mode:            {fill_mode.value:>12}")
     print(f"Bars replayed:        {len(result.equity_curve):>12,}")
     print(f"Completed trades:     {metrics['num_trades']:>12,.0f}")
     print(f"Total return:         {metrics['total_return_pct']:>11.2f}%")
@@ -140,6 +152,11 @@ def print_report(result: BacktestResult, symbol: str, strategy_name: str) -> Non
         print(
             f"NOTE: open position of {result.open_position_qty:.8f} base units "
             "remained at the end (marked to market in equity)."
+        )
+    if fill_mode is FillMode.MAKER_OPTIMISTIC:
+        print(
+            "WARNING: maker_optimistic assumes every price touch fills (no queue modeling) "
+            "— results are an optimistic bound."
         )
     print()
 
@@ -159,15 +176,18 @@ def run_backtest(args: argparse.Namespace, config: AppConfig) -> None:
     if len(bars) < 2:
         sys.exit("Not enough data returned for the requested range.")
     strategy = STRATEGIES[args.strategy](**strategy_kwargs(args))
+    backtest_config = config.backtest
+    if args.fill_mode is not None:
+        backtest_config = dataclasses.replace(backtest_config, fill_mode=FillMode(args.fill_mode))
     risk_manager = RiskManager(
         RiskLimits(
-            max_position_quote=config.backtest.position_size_quote,
+            max_position_quote=backtest_config.position_size_quote,
             max_position_pct=0.25,
         )
     )
-    engine = BacktestEngine(strategy, risk_manager, config.fees, config.backtest, args.symbol)
+    engine = BacktestEngine(strategy, risk_manager, config.fees, backtest_config, args.symbol)
     result = engine.run(bars)
-    print_report(result, args.symbol, args.strategy)
+    print_report(result, args.symbol, args.strategy, backtest_config.fill_mode)
 
 
 def main() -> None:
