@@ -42,6 +42,24 @@ def parse_args() -> argparse.Namespace:
         choices=sorted(STRATEGIES),
         help="Strategy to run (Stage 1 ships only the random fee sanity check)",
     )
+    parser.add_argument(
+        "--ma-window",
+        type=int,
+        default=20,
+        help="mean_reversion only: SMA lookback in bars",
+    )
+    parser.add_argument(
+        "--entry-band-bps",
+        type=float,
+        default=20.0,
+        help="mean_reversion only: entry dip below the SMA in basis points (20 = 0.2%%)",
+    )
+    parser.add_argument(
+        "--exit-band-bps",
+        type=float,
+        default=0.0,
+        help="mean_reversion only: exit deviation above the SMA in basis points",
+    )
     parser.add_argument("--start", help="Backtest start date, YYYY-MM-DD (UTC)")
     parser.add_argument("--end", help="Backtest end date, YYYY-MM-DD (UTC, exclusive)")
     parser.add_argument(
@@ -73,6 +91,28 @@ def resolve_range(args: argparse.Namespace) -> tuple[int, int]:
         end = datetime.now(timezone.utc)
         start = end - timedelta(days=args.days)
     return int(start.timestamp() * 1000), int(end.timestamp() * 1000)
+
+
+def strategy_kwargs(args: argparse.Namespace) -> dict[str, int | float]:
+    """Map CLI flags to constructor kwargs for the selected strategy.
+
+    Strategies not listed here take no CLI parameters and are constructed
+    with their defaults.
+
+    Args:
+        args: Parsed CLI arguments.
+
+    Returns:
+        Keyword arguments for the strategy constructor (bps converted to
+        fractions where applicable).
+    """
+    if args.strategy == "mean_reversion":
+        return {
+            "window": args.ma_window,
+            "entry_band": args.entry_band_bps / 10_000,
+            "exit_band": args.exit_band_bps / 10_000,
+        }
+    return {}
 
 
 def print_report(result: BacktestResult, symbol: str, strategy_name: str) -> None:
@@ -118,7 +158,7 @@ def run_backtest(args: argparse.Namespace, config: AppConfig) -> None:
     bars = get_klines(args.symbol, args.interval, start_ms, end_ms)
     if len(bars) < 2:
         sys.exit("Not enough data returned for the requested range.")
-    strategy = STRATEGIES[args.strategy]()
+    strategy = STRATEGIES[args.strategy](**strategy_kwargs(args))
     risk_manager = RiskManager(
         RiskLimits(
             max_position_quote=config.backtest.position_size_quote,
